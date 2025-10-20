@@ -980,7 +980,7 @@ async def main():
     app.add_handler(MessageHandler(filters.VOICE | filters.AUDIO, handle_audio))
 
     # Run the bot
-    app.run_polling()
+    # app.run_polling()
 
     # === WEBHOOK SETUP ===
     # Render will provide PORT in environment variables
