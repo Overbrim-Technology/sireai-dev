@@ -983,25 +983,29 @@ async def main():
     # app.run_polling()
 
     # === WEBHOOK SETUP ===
-    # Render will provide PORT in environment variables
+    # === WEBHOOK CONFIG ===
     port = int(os.getenv("PORT", PORT))
-
-    # Remove any old webhook before setting new one
     await app.bot.delete_webhook()
     await app.bot.set_webhook(WEBHOOK_URL)
 
     print(f"🚀 Webhook set at {WEBHOOK_URL} listening on port {port}...")
 
-    # Start webhook server (non-blocking)
-    await app.run_webhook(
+    # 👇 FIXED PART
+    # run_webhook() tries to close loop internally — Render keeps it alive.
+    # So we just run the internal webhook startup manually:
+    await app.initialize()
+    await app.start()
+    await app.updater.start_webhook(
         listen="0.0.0.0",
         port=port,
         url_path=TELEGRAM_BOT_TOKEN,
         webhook_url=WEBHOOK_URL,
-        stop_signals=None,
     )
 
+    print("✅ Webhook server running. Waiting for Telegram updates...")
 
+    # Keep it running forever
+    await asyncio.Event().wait()
 
 if __name__ == "__main__":
     asyncio.run(main())
