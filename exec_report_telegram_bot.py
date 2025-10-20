@@ -4,7 +4,7 @@ import sqlite3
 import logging
 import requests
 import time
-import whisper
+# import whisper
 import assemblyai as aai
 from datetime import datetime
 from dotenv import load_dotenv
@@ -42,7 +42,7 @@ logging.basicConfig(level=logging.INFO)
 genai.configure(api_key=GEMINI_API_KEY)
 model = genai.GenerativeModel("gemini-2.5-flash")
 # Load Whisper model once (large-v3)
-audiomodel = whisper.load_model("turbo")
+# audiomodel = whisper.load_model("turbo")
 
 # === SETUP DB ===
 # def init_db():
