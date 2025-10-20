@@ -21,6 +21,9 @@ from exec_report_dev import reset_onboarding, promote_user, demote_user, get_use
 # === CONFIGURATION ===
 load_dotenv()
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
+WEBHOOK_URL = f"https://sireai-dev.onrender.com/{TELEGRAM_BOT_TOKEN}"
+PORT = int(os.getenv("PORT", 8080))
+
 # Read admin IDs from .env and split into a list of integers
 DEV_USER_IDS = [int(x) for x in os.getenv("DEV_USER_IDS", "").split(",") if x]
 ADMIN_USER_IDS = [int(x.strip()) for x in os.getenv("TELEGRAM_ADMIN_IDS", "").split(",") if x.strip()]
@@ -933,7 +936,7 @@ async def send_executive_update(chat, username, timestamp, structured_text, imag
 
 
 # === MAIN FUNCTION ===
-def main():
+async def main():
     init_db()
     migrate_db()
     app = ApplicationBuilder().token(TELEGRAM_BOT_TOKEN).build()
@@ -979,6 +982,25 @@ def main():
     # Run the bot
     app.run_polling()
 
+    # === WEBHOOK SETUP ===
+    # Render will provide PORT in environment variables
+    port = int(os.getenv("PORT", PORT))
+
+    # Remove any old webhook before setting new one
+    await app.bot.delete_webhook()
+    await app.bot.set_webhook(WEBHOOK_URL)
+
+    print(f"🚀 Webhook set at {WEBHOOK_URL} listening on port {port}...")
+
+    # Start webhook server (non-blocking)
+    await app.run_webhook(
+        listen="0.0.0.0",
+        port=port,
+        url_path=TELEGRAM_BOT_TOKEN,
+        webhook_url=WEBHOOK_URL,
+    )
+
+
 
 if __name__ == "__main__":
-    main()
+    asyncio.run(main())
