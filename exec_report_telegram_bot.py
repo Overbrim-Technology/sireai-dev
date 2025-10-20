@@ -21,7 +21,7 @@ from exec_report_dev import reset_onboarding, promote_user, demote_user, get_use
 # === CONFIGURATION ===
 load_dotenv()
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
-WEBHOOK_URL = f"https://sireai-dev.onrender.com/{TELEGRAM_BOT_TOKEN}"
+WEBHOOK_URL = f"https://{os.getenv('RENDER_EXTERNAL_HOSTNAME')}/{TELEGRAM_BOT_TOKEN}"
 PORT = int(os.getenv("PORT", 8080))
 
 # Read admin IDs from .env and split into a list of integers
@@ -998,10 +998,10 @@ async def main():
         port=port,
         url_path=TELEGRAM_BOT_TOKEN,
         webhook_url=WEBHOOK_URL,
+        stop_signals=None,
     )
 
 
 
 if __name__ == "__main__":
-    loop = asyncio.get_event_loop()
-    loop.run_until_complete(main())
+    asyncio.run(main())
