@@ -13,29 +13,18 @@ from telegram import Update, InputFile, KeyboardButton, ReplyKeyboardMarkup, Rep
 from telegram.ext import ApplicationBuilder, ConversationHandler, CommandHandler, MessageHandler, filters, ContextTypes, CallbackQueryHandler
 import google.generativeai as genai
 
+from settings import (GEMINI_API_KEY, GEMINI_API_URL, TELEGRAM_BOT_TOKEN, ASSEMBLYAI_API_KEY, WEBHOOK_URL, PORT,
+                      SUPPORTED_FORMATS, DEV_USER_IDS, ADMIN_USER_IDS, EXEC_IDS,
+                      init_db_pool
+                      )
+
 from exec_report_onboarding import (start, org_choice, org_name, first_name, surname, cancel,
                                     FIRST_NAME, SURNAME, ORG_CHOICE, ORG_NAME, START_KEYBOARD)
                                     
 from exec_report_dev import reset_onboarding, promote_user, demote_user, get_user_roles, clear_user_roles_cache
 
-# === CONFIGURATION ===
+
 load_dotenv()
-TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
-WEBHOOK_URL = f"https://{os.getenv('RENDER_EXTERNAL_HOSTNAME')}/{TELEGRAM_BOT_TOKEN}"
-PORT = int(os.getenv("PORT", 8080))
-
-# Read admin IDs from .env and split into a list of integers
-DEV_USER_IDS = [int(x) for x in os.getenv("DEV_USER_IDS", "").split(",") if x]
-ADMIN_USER_IDS = [int(x.strip()) for x in os.getenv("TELEGRAM_ADMIN_IDS", "").split(",") if x.strip()]
-EXEC_IDS = [int(x) for x in os.getenv("EXEC_IDS", "").split(",") if x]
-# Allowed audio file extensions
-SUPPORTED_FORMATS = {".mp3", ".wav", ".m4a", ".flac", ".ogg", ".webm"}
-
-GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
-GEMINI_API_URL = "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent"
-DB_PATH = "work_updates.db"
-aai.settings.api_key = os.getenv("ASSEMBLYAI_API_KEY")
-ASSEMBLYAI_API_KEY = os.getenv("ASSEMBLYAI_API_KEY")
 
 
 # === SETUP LOGGING ===
@@ -48,152 +37,83 @@ model = genai.GenerativeModel("gemini-2.5-flash")
 # audiomodel = whisper.load_model("turbo")
 
 # === SETUP DB ===
-# def init_db():
-#     conn = sqlite3.connect(DB_PATH)
-#     cursor = conn.cursor()
-#     cursor.execute("""
-#         CREATE TABLE IF NOT EXISTS organizations (
-#             id INTEGER PRIMARY KEY AUTOINCREMENT,
-#             name TEXT UNIQUE
-#         )
-#     """)
-#     cursor.execute("""
-#         CREATE TABLE IF NOT EXISTS users (
-#             user_id INTEGER PRIMARY KEY,
-#             username TEXT,
-#             org TEXT,
-#             FOREIGN KEY(org) REFERENCES organizations(name)
-#         )
-#     """)
-#     cursor.execute("""
-#     CREATE TABLE IF NOT EXISTS updates (
-#         id INTEGER PRIMARY KEY AUTOINCREMENT,
-#         user_id INTEGER,
-#         username TEXT,
-#         organization TEXT,
-#         original_text TEXT,       -- raw input (user text or transcription)
-#         structured_text TEXT,     -- AI-cleaned / structured version
-#         image_path TEXT,
-#         timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
-#     )
-#     """)
-#     conn.commit()
-#     conn.close()
-def init_db():
-    conn = sqlite3.connect(DB_PATH)
-    cursor = conn.cursor()
+async def init_db():
+    """Create tables with org-specific roles and indexes."""
+    pool = await init_db_pool()
 
-    # Organizations
-    cursor.execute("""
-        CREATE TABLE IF NOT EXISTS organizations (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            name TEXT UNIQUE
-        )
-    """)
+    schema_sql = """
+    -- Organizations table
+    CREATE TABLE IF NOT EXISTS organizations (
+        id SERIAL PRIMARY KEY,
+        name TEXT UNIQUE NOT NULL
+    );
 
-    # Users
-    cursor.execute("""
-        CREATE TABLE IF NOT EXISTS users (
-            user_id INTEGER PRIMARY KEY,         -- Telegram user ID
-            username TEXT,                       -- Telegram username
-            first_name TEXT,
-            surname TEXT,
-            org TEXT,
-            executive INTEGER DEFAULT 0,         -- Boolean (0 = False, 1 = True)
-            admin INTEGER DEFAULT 0,             -- Boolean (0 = False, 1 = True)
-            FOREIGN KEY(org) REFERENCES organizations(name)
-        )
-    """)
+    -- Users table
+    CREATE TABLE IF NOT EXISTS users (
+        user_id BIGINT PRIMARY KEY,
+        username TEXT,
+        first_name TEXT,
+        surname TEXT
+    );
 
-    # Updates
-    cursor.execute("""
-        CREATE TABLE IF NOT EXISTS updates (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            user_id INTEGER,
-            username TEXT,
-            organization TEXT,
-            original_text TEXT,       -- raw input (user text or transcription)
-            structured_text TEXT,     -- AI-cleaned / structured version
-            image_path TEXT,
-            timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
-            FOREIGN KEY(user_id) REFERENCES users(user_id)
-        )
-    """)
+    -- Join table: users <-> organizations, with org-specific roles
+    CREATE TABLE IF NOT EXISTS user_orgs (
+        id SERIAL PRIMARY KEY,
+        user_id BIGINT REFERENCES users(user_id) ON DELETE CASCADE,
+        org_id INTEGER REFERENCES organizations(id) ON DELETE CASCADE,
+        executive BOOLEAN DEFAULT FALSE,
+        admin BOOLEAN DEFAULT FALSE,
+        UNIQUE(user_id, org_id)
+    );
 
-    # Visits
-    cursor.execute("""
-        CREATE TABLE IF NOT EXISTS visits (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            user_id INTEGER NOT NULL,
-            visit_time DATETIME DEFAULT CURRENT_TIMESTAMP,
-            FOREIGN KEY(user_id) REFERENCES users(user_id)
-        )
-    """)
+    -- Updates table per org
+    CREATE TABLE IF NOT EXISTS updates (
+        id SERIAL PRIMARY KEY,
+        user_id BIGINT REFERENCES users(user_id),
+        org_id INTEGER REFERENCES organizations(id),
+        username TEXT,
+        original_text TEXT,
+        structured_text TEXT,
+        image_path TEXT,
+        timestamp TIMESTAMP DEFAULT NOW()
+    );
 
-    conn.commit()
-    conn.close()
+    -- Visits log table
+    CREATE TABLE IF NOT EXISTS visits (
+        id SERIAL PRIMARY KEY,
+        user_id BIGINT REFERENCES users(user_id),
+        visit_time TIMESTAMP DEFAULT NOW()
+    );
 
+    -- Indexes for faster lookups
+    CREATE INDEX IF NOT EXISTS idx_user_orgs_user_id ON user_orgs(user_id);
+    CREATE INDEX IF NOT EXISTS idx_user_orgs_org_id ON user_orgs(org_id);
+    CREATE INDEX IF NOT EXISTS idx_updates_user_id ON updates(user_id);
+    CREATE INDEX IF NOT EXISTS idx_updates_org_id ON updates(org_id);
+    CREATE INDEX IF NOT EXISTS idx_visits_user_id ON visits(user_id);
+    """
 
-# === DB MIGRATION ===
-def migrate_db():
-    conn = sqlite3.connect(DB_PATH)
-    cursor = conn.cursor()
+    async with pool.acquire() as conn:
+        await conn.execute(schema_sql)
+        print("✅ Database initialized with multi-org support and role flags per org.")
 
-    # === USERS TABLE MIGRATION ===
-    cursor.execute("PRAGMA table_info(users)")
-    user_columns = [col[1] for col in cursor.fetchall()]
-
-    if "first_name" not in user_columns:
-        cursor.execute("ALTER TABLE users ADD COLUMN first_name TEXT")
-    if "surname" not in user_columns:
-        cursor.execute("ALTER TABLE users ADD COLUMN surname TEXT")
-    if "executive" not in user_columns:
-        cursor.execute("ALTER TABLE users ADD COLUMN executive INTEGER DEFAULT 0")
-    if "admin" not in user_columns:
-        cursor.execute("ALTER TABLE users ADD COLUMN admin INTEGER DEFAULT 0")
-
-    # === UPDATES TABLE MIGRATION ===
-    cursor.execute("PRAGMA table_info(updates)")
-    update_columns = [col[1] for col in cursor.fetchall()]
-
-    # Add missing user_id column
-    if "user_id" not in update_columns:
-        cursor.execute("ALTER TABLE updates ADD COLUMN user_id INTEGER")
-
-    # Add missing organization column
-    if "organization" not in update_columns:
-        cursor.execute("ALTER TABLE updates ADD COLUMN organization TEXT")
-
-    # Backfill organization where possible
-    cursor.execute("""
-        UPDATE updates
-        SET organization = (
-            SELECT org FROM users WHERE users.user_id = updates.user_id
-        )
-        WHERE organization IS NULL
-    """)
-
-    conn.commit()
-    conn.close()
-    print("Database migration & backfill complete.")
-
+    return pool
 
 # Onboarding
 # === Start function (personalized + HTML) ===
 async def start_wrapper(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
 
-    # 🔎 Replace with your actual DB query
-    user_data = get_user_data(user_id)  
-    # Example structure: {"first_name": "Rotimi", "surname":"Olasehinde", "org_name": "Overbrim"}
+    user_data = await get_user_data(user_id)  # asyncpg version
+    # user_data could be {"first_name": "...", "surname": "...", "orgs": ["Overbrim", "OtherOrg"]}
 
     if user_data:
-        # 🎉 Already registered user
         first_name = user_data.get("first_name", "Friend")
-        org_name = user_data.get("org_name", "Earth")
+        orgs = user_data.get("orgs", [])
+        org_display = orgs[0] if orgs else "Earth"
 
         await update.message.reply_text(
-            f"🎉 Welcome back, <b>{first_name}</b> from <b>{org_name}</b>! 🚀\n\n"
+            f"🎉 Welcome back, <b>{first_name}</b> from <b>{org_display}</b>! 🚀\n\n"
             "Use the menu below to continue.",
             parse_mode="HTML",
             reply_markup=START_KEYBOARD
@@ -202,17 +122,17 @@ async def start_wrapper(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return ConversationHandler.END
 
     else:
-        # 👋 New user onboarding
         return await start(update, context)
 
+
 async def org_name_wrapper(update, context):
-    result = await org_name(update, context)
+    result = await org_name(update, context)  # asyncpg-aware org_name
     if result == "onboarding_complete":
-        await update.message.reply_text("🎉 You’re all set! Let's go Sire 👑!", reply_markup=ReplyKeyboardRemove())
-
-        # Small delay helps ensure Telegram processes the keyboard removal first
+        await update.message.reply_text(
+            "🎉 You’re all set! Let's go Sire 👑!",
+            reply_markup=ReplyKeyboardRemove()
+        )
         await asyncio.sleep(0.3)
-
         await show_main_menu(update, context)
         return ConversationHandler.END
     elif result == "retry_org_name":
@@ -232,7 +152,7 @@ def is_none(user_id: int) -> bool:
     return get_user_roles(user_id)["none"]
 
 def get_all_admin_ids() -> list:
-    conn = sqlite3.connect(DB_PATH)
+    conn = get_db_connection()
     cursor = conn.cursor()
     cursor.execute("SELECT user_id FROM users WHERE admin = 1")
     rows = cursor.fetchall()
@@ -244,7 +164,7 @@ def get_user_data(user_id: int) -> dict | None:
     Fetch user details (first_name, org_name) from DB.
     Also logs the visit timestamp if the user exists.
     """
-    conn = sqlite3.connect(DB_PATH)
+    conn = get_db_connection()
     cursor = conn.cursor()
 
     # 🔹 Adjust column names if needed
@@ -268,12 +188,6 @@ def get_user_data(user_id: int) -> dict | None:
     conn.close()
     return None
 
-# def is_admin(user_id: int) -> bool:
-#     return str(user_id) in os.getenv("TELEGRAM_ADMIN_IDS", "").split(",")
-
-# def is_exec(user_id: int) -> bool:
-#     return str(user_id) in os.getenv("EXEC_IDS", "").split(",")
-
 # === File Types ===
 def is_supported_file(filename: str) -> bool:
     """Check if file has a supported audio extension."""
@@ -287,7 +201,7 @@ def structure_text(text: str) -> str:
 
     prompt = (
         "You are a helpful assistant that structures work updates for busy executives. "
-        "Limit each section to no more than 5 bullet points and each point to 10 words or less"
+        "Limit each section to no more than 4 bullet points and each point to 9 words or less"
         "Format your response in HTML suitable for Telegram's HTML parse mode. "
         "Follow this exact template:\n\n"
         f"<b>Date:</b> {today}\n\n"
@@ -295,7 +209,7 @@ def structure_text(text: str) -> str:
         "• [Concise bullet point 1]\n"
         "• [Concise bullet point 2]\n"
         "• [Concise bullet point 3]\n"
-        "• [etc., up to 5 points]\n\n"
+        "• [etc., up to 4 points]\n\n"
         "<b>Incidence/Delay:</b>\n"
         "• [Concise bullet point 1]\n"
         "• [etc., or '• None.' if no issues]\n\n"
@@ -316,7 +230,7 @@ def structure_text(text: str) -> str:
 #     conn.commit()
 #     conn.close()
 def save_update(user_id, username, organization, original_text, structured_text, image_path=None):
-    conn = sqlite3.connect(DB_PATH)
+    conn = get_db_connection()
     cursor = conn.cursor()
     cursor.execute("""
         INSERT INTO updates (user_id, username, organization, original_text, structured_text, image_path)
@@ -774,17 +688,8 @@ async def handle_audio(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await message.reply_text("📢 Processing your audio...")
 
     try:
-        # transcriber = aai.Transcriber()
-        # transcript = transcriber.transcribe(file_path)
-        # # Transcription with AssemblyAI
-        # transcriber = aai.Transcriber()
-        # # Run the blocking transcription in a separate thread
-        # loop = asyncio.get_running_loop()
-        # transcript = await loop.run_in_executor(None, transcriber.transcribe, file_path)
-        # transcript = await context.application.run_in_executor(None, transcriber.transcribe, file_path)
         transcript = transcribe_audio_assemblyai(file_path)
         transcribed_text = transcript.strip()
-        # result = transcribe_audio_assemblyai(file_path)
 
         # Transcription with Whisper
         # result = audiomodel.transcribe(file_path)
@@ -938,7 +843,9 @@ async def send_executive_update(chat, username, timestamp, structured_text, imag
 # === MAIN FUNCTION ===
 async def main():
     init_db()
-    migrate_db()
+
+    await init_db_pool()
+
     app = ApplicationBuilder().token(TELEGRAM_BOT_TOKEN).build()
 
     # Conversation for org selection

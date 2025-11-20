@@ -5,10 +5,9 @@ from functools import lru_cache
 from telegram import Update
 from telegram.ext import ContextTypes
 
+from settings import DEV_USER_IDS, get_db_connection
 
 load_dotenv()
-DB_PATH = "work_updates.db"
-DEV_USER_IDS = [int(x) for x in os.getenv("DEV_USER_IDS", "").split(",") if x]
 
 # === USER ROLES ===
 @lru_cache(maxsize=256)  # cache results for up to 256 different user_ids
@@ -17,7 +16,7 @@ def get_user_roles(user_id: int) -> dict:
     Fetch a user's roles from the database (cached).
     Returns a dict with boolean flags for all roles: admin, exec, user, none.
     """
-    conn = sqlite3.connect(DB_PATH)
+    conn = get_db_connection()
     cursor = conn.cursor()
     cursor.execute("SELECT admin, executive FROM users WHERE user_id = ?", (user_id,))
     row = cursor.fetchone()
@@ -63,7 +62,7 @@ async def promote_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Usage: /promote <user_id> <admin|executive>")
         return
 
-    conn = sqlite3.connect(DB_PATH)
+    conn = get_db_connection()
     cursor = conn.cursor()
 
     if role == "admin":
@@ -108,7 +107,7 @@ async def demote_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Usage: /demote <user_id> <admin|executive>")
         return
 
-    conn = sqlite3.connect(DB_PATH)
+    conn = get_db_connection()
     cursor = conn.cursor()
 
     if role == "admin":
@@ -156,7 +155,7 @@ async def reset_onboarding(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("⚠️ Invalid user_id format. Must be a number.")
         return
 
-    conn = sqlite3.connect(DB_PATH)
+    conn = get_db_connection()
     cursor = conn.cursor()
 
     # Delete user record

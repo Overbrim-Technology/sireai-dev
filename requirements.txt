@@ -5,3 +5,4 @@ pillow
 google-generativeai
 assemblyai
 requests
+asyncpg
