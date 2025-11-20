@@ -8,14 +8,13 @@ import time
 import assemblyai as aai
 from datetime import datetime
 from dotenv import load_dotenv
-from functools import lru_cache
 from telegram import Update, InputFile, KeyboardButton, ReplyKeyboardMarkup, ReplyKeyboardRemove, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import ApplicationBuilder, ConversationHandler, CommandHandler, MessageHandler, filters, ContextTypes, CallbackQueryHandler
 import google.generativeai as genai
 
 from settings import (GEMINI_API_KEY, GEMINI_API_URL, TELEGRAM_BOT_TOKEN, ASSEMBLYAI_API_KEY, WEBHOOK_URL, PORT,
                       SUPPORTED_FORMATS, DEV_USER_IDS, ADMIN_USER_IDS, EXEC_IDS,
-                      init_db_pool
+                      init_db_pool, pool
                       )
 
 from exec_report_onboarding import (start, org_choice, org_name, first_name, surname, cancel,
@@ -141,52 +140,93 @@ async def org_name_wrapper(update, context):
 
 
 # === USER ROLES ===
-def is_admin(user_id: int) -> bool:
-    return get_user_roles(user_id)["admin"]
-
-def is_exec(user_id: int) -> bool:
-    return get_user_roles(user_id)["executive"]
-
-# not registered i.e new users
-def is_none(user_id: int) -> bool:
-    return get_user_roles(user_id)["none"]
-
-def get_all_admin_ids() -> list:
-    conn = get_db_connection()
-    cursor = conn.cursor()
-    cursor.execute("SELECT user_id FROM users WHERE admin = 1")
-    rows = cursor.fetchall()
-    conn.close()
-    return [int(row[0]) for row in rows if row[0].isdigit()]
-
-def get_user_data(user_id: int) -> dict | None:
-    """
-    Fetch user details (first_name, org_name) from DB.
-    Also logs the visit timestamp if the user exists.
-    """
-    conn = get_db_connection()
-    cursor = conn.cursor()
-
-    # 🔹 Adjust column names if needed
-    cursor.execute("SELECT first_name, surname, org FROM users WHERE user_id=?", (user_id,))
-    row = cursor.fetchone()
-
-    if row:
-        first_name, surname, org_name = row
-
-        # ✅ Log visit
-        timestamp = datetime.now().isoformat()
-        cursor.execute(
-            "INSERT INTO visits (user_id, visit_time) VALUES (?, ?)",
-            (user_id, timestamp)
+async def is_admin(user_id: int, org_id: int) -> bool:
+    """Check if a user is admin in a specific organization."""
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow(
+            "SELECT 1 FROM user_orgs WHERE user_id=$1 AND org_id=$2 AND admin=TRUE",
+            user_id, org_id
         )
-        conn.commit()
+    return row is not None
 
-        conn.close()
-        return {"first_name": first_name, "surname": surname, "org_name": org_name}
+async def is_exec(user_id: int, org_id: int) -> bool:
+    """Check if a user is executive in a specific organization."""
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow(
+            "SELECT 1 FROM user_orgs WHERE user_id=$1 AND org_id=$2 AND executive=TRUE",
+            user_id, org_id
+        )
+    return row is not None
 
-    conn.close()
-    return None
+async def is_none(user_id: int) -> bool:
+    """Check if a user is not part of any organization."""
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow(
+            "SELECT 1 FROM user_orgs WHERE user_id=$1 LIMIT 1",
+            user_id
+        )
+    return row is None
+
+async def get_all_admin_ids() -> list[int]:
+    """Return a list of all user_ids who are admin in any org."""
+    async with pool.acquire() as conn:
+        rows = await conn.fetch("SELECT DISTINCT user_id FROM user_orgs WHERE admin=TRUE")
+        return [r["user_id"] for r in rows]
+
+async def get_admin_org_ids(user_id: int) -> list[int]:
+    """Return a list of org IDs where the user is admin."""
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(
+            "SELECT org_id FROM user_orgs WHERE user_id=$1 AND admin=TRUE",
+            user_id
+        )
+        return [r["org_id"] for r in rows]
+
+
+async def get_user_data(telegram_id: int) -> dict | None:
+    async with pool.acquire() as conn:
+
+        # Fetch user core data
+        user = await conn.fetchrow(
+            """
+            SELECT id, first_name, surname
+            FROM users
+            WHERE telegram_id = $1
+            """,
+            telegram_id
+        )
+
+        if not user:
+            return None
+
+        user_id = user["id"]
+
+        # Fetch user organizations (may be many)
+        org_rows = await conn.fetch(
+            """
+            SELECT o.name
+            FROM organizations o
+            JOIN user_orgs uo ON o.id = uo.org_id
+            WHERE uo.user_id = $1
+            """,
+            user_id
+        )
+
+        org_list = [r["name"] for r in org_rows]
+
+        # Log visit
+        await conn.execute(
+            "INSERT INTO visits (user_id, visit_time) VALUES ($1, $2)",
+            user_id,
+            datetime.utcnow()
+        )
+
+        return {
+            "first_name": user["first_name"],
+            "surname": user["surname"],
+            "organizations": org_list
+        }
+
 
 # === File Types ===
 def is_supported_file(filename: str) -> bool:
@@ -220,49 +260,26 @@ def structure_text(text: str) -> str:
     return response.text.strip()
 
 # === STORE IN DB ===
-# def save_update(telegram_id, username, original_text, structured_text, image_path=None):
-#     conn = sqlite3.connect(DB_PATH)
-#     cursor = conn.cursor()
-#     cursor.execute('''
-#     INSERT INTO updates (telegram_id, username, original_text, structured_text, image_path)
-#     VALUES (?, ?, ?, ?, ?)
-#     ''', (telegram_id, username, original_text, structured_text, image_path))
-#     conn.commit()
-#     conn.close()
-def save_update(user_id, username, organization, original_text, structured_text, image_path=None):
-    conn = get_db_connection()
-    cursor = conn.cursor()
-    cursor.execute("""
-        INSERT INTO updates (user_id, username, organization, original_text, structured_text, image_path)
-        VALUES (?, ?, ?, ?, ?, ?)
-    """, (user_id, username, organization, original_text, structured_text, image_path))
-    conn.commit()
-    conn.close()
+async def save_update(user_id: int, username: str, org_id: int, original_text: str, structured_text: str, image_path: str | None):
+    async with pool.acquire() as conn:
+        await conn.execute(
+            """
+            INSERT INTO updates 
+                (user_id, username, org_id, original_text, structured_text, image_path)
+            VALUES ($1, $2, $3, $4, $5, $6)
+            """,
+            user_id,
+            username,
+            org_id,
+            original_text,
+            structured_text,
+            image_path
+        )
 
 # Track user states
 user_state = {}
 
 # First screen
-# START_KEYBOARD = ReplyKeyboardMarkup(
-#     [["▶️ Start"]],
-#     resize_keyboard=True,
-#     one_time_keyboard=False
-# )
-
-# === MAIN MENU BUTTONS ===
-# MAIN_MENU = ReplyKeyboardMarkup(
-#     [["✏️ Send Update", "📋 Get Updates", "🗑 Clear Updates"]],
-#     resize_keyboard=True
-# )
-
-# === /start START COMMAND ===
-# async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-#     keyboard = [[KeyboardButton("▶️ Start")]]
-#     await update.message.reply_text(
-#         "👋 Welcome! Tap '▶️ Start' to begin.",
-#         reply_markup=ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
-#     )
-
 async def handle_start_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await show_main_menu(update, context)
 
@@ -337,68 +354,6 @@ async def show_main_menu(update_or_query, context: ContextTypes.DEFAULT_TYPE):
     else:
         await chat.reply_text("📋 Main Menu", reply_markup=markup)
 
-# async def show_main_menu(update_or_query, context: ContextTypes.DEFAULT_TYPE):
-#     """Show menu according to role and reset state."""
-#     global user_state
-
-#     # if getattr(update_or_query, "callback_query", None):
-#     #     # Inline button press
-#     #     user_id = update_or_query.callback_query.from_user.id
-#     #     chat = update_or_query.callback_query.message
-#     # else:
-#     # Normal text message
-#     user_id = update_or_query.message.from_user.id
-#     chat = update_or_query.message
-
-#     # ✅ Reset state
-#     user_state.pop(user_id, None)
-
-#     # Build role-based inline menu
-#     if is_exec(user_id):
-#         reply_keyboard = [
-#             [KeyboardButton("📄 Last Update")],
-#             [KeyboardButton("📜 Recent Updates")],
-#             [KeyboardButton("🔄 More Options")],
-#             [KeyboardButton("▶️ Start")]
-#         ]
-#     else:
-#         reply_keyboard = [
-#             [KeyboardButton("📝 Send Update")],
-#             [KeyboardButton("📜 Recent Updates")],
-#             [KeyboardButton("▶️ Start")]
-#         ]
-
-#     # Always show Start in ReplyKeyboardMarkup
-#     # reply_keyboard = ReplyKeyboardMarkup(
-#     #     [[KeyboardButton("▶️ Start")]],
-#     #     resize_keyboard=True
-#     # )
-
-#     markup = ReplyKeyboardMarkup(reply_keyboard, resize_keyboard=True)
-
-#     # Always reply with the menu
-#     # await chat.reply_text("📋 Main Menu:", reply_markup=markup)
-
-#     # if edit_message:
-#     #     await update_or_query.callback_query.edit_message_text(
-#     #         "📋 Main Menu:",
-#     #         reply_markup=InlineKeyboardMarkup(inline_keyboard)
-#     #     )
-#     #     # Send separate reply keyboard
-#     #     await context.bot.send_message(
-#     #         chat_id=user_id,
-#     #         text="Use ▶️ Start to restart anytime.",
-#     #         reply_markup=reply_keyboard
-#     #     )
-#     # else:
-#     #     await update_or_query.message.reply_text(
-#     #         "📋 Main Menu:",
-#     #         reply_markup=InlineKeyboardMarkup(inline_keyboard)
-#     #     )
-#     #     await update_or_query.message.reply_text(
-#     #         "Use ▶️ Start to restart anytime.",
-#     #         reply_markup=reply_keyboard
-#     #     )
 
 # ===== CALLBACKS =====
 async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -492,7 +447,7 @@ async def send_update(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # === CLEAR UPDATES (ADMIN ONLY) ===
 async def clear_updates(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # Handle both callback and command cases
+    # Determine user and chat
     if update.callback_query:
         query = update.callback_query
         await query.answer()
@@ -504,24 +459,28 @@ async def clear_updates(update: Update, context: ContextTypes.DEFAULT_TYPE):
     else:
         return
 
-    if not is_admin(user_id):
-        print(f"Unauthorized clear attempt by user {user_id}")
-        await chat.reply_text("🚫 You are not authorized to clear updates.")
+    # Get active organization for this user (assume stored in user_data)
+    org_id = context.user_data.get("active_org_id")
+    if org_id is None:
+        await chat.reply_text("⚠ Please select an organization first to manage updates.")
         return
 
-    # Reset only this admin's state
-    user_state.pop(user_id, None)
+    # Admin check per org
+    if not await is_admin(user_id, org_id):
+        print(f"Unauthorized clear attempt by user {user_id} for org {org_id}")
+        await chat.reply_text("🚫 You are not authorized to clear updates for this organization.")
+        return
 
+    # Ask for confirmation
     keyboard = [
-        [InlineKeyboardButton("✅ Yes, clear all", callback_data="confirm_clear")],
+        [InlineKeyboardButton("✅ Yes, clear all", callback_data=f"confirm_clear:{org_id}")],
         [InlineKeyboardButton("❌ Cancel", callback_data="cancel_clear")]
     ]
-    reply_markup = InlineKeyboardMarkup(keyboard)
-
     await chat.reply_text(
-        "⚠ Are you sure you want to delete ALL updates and images?",
-        reply_markup=reply_markup
+        "⚠ Are you sure you want to delete ALL updates and images for this organization?",
+        reply_markup=InlineKeyboardMarkup(keyboard)
     )
+
 
 # === CONFIRMATION HANDLER (ADMIN ONLY) ===
 async def handle_confirmation(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -530,55 +489,54 @@ async def handle_confirmation(update: Update, context: ContextTypes.DEFAULT_TYPE
     user_id = query.from_user.id
     choice = query.data
 
-    print(f"DEBUG: handle_confirmation triggered with choice = {choice}")
-
-    # ✅ Authorization check
-    if not is_admin(user_id):
-        print(f"Unauthorized clear attempt by user {user_id}")
-        await query.edit_message_text("🚫 You are not authorized to clear updates.")
+    if choice != "confirm_clear":
+        await query.edit_message_text("❌ Cancelled.")
         await show_main_menu(update, context)
         return
 
-    if choice == "confirm_clear":
-        image_paths = []
-        try:
-            conn = sqlite3.connect(DB_PATH)
-            cursor = conn.cursor()
-            cursor.execute("SELECT image_path FROM updates")
-            image_paths = cursor.fetchall()
-            cursor.execute("DELETE FROM updates")
-            deleted_count = cursor.rowcount
-            conn.commit()
-            print(f"Cleared {deleted_count} updates from DB")
-        except Exception as e:
-            print(f"Error clearing updates: {e}")
-        finally:
-            if conn:
-                conn.close()
+    # 🚨 Admin Authorization
+    admin_orgs = await get_admin_org_ids(user_id)
+    if not admin_orgs:
+        await query.edit_message_text("🚫 You are not an admin of any organization.")
+        return
 
-        # Delete images from disk
-        removed, failed = 0, 0
-        for img in image_paths:
-            if img[0] and os.path.exists(img[0]):
-                try:
-                    os.remove(img[0])
-                    removed += 1
-                except Exception as e:
-                    failed += 1
-                    print(f"Failed to delete {img[0]}: {e}")
+    # 🔥 Delete updates ONLY for these orgs
+    org_tuple = tuple(admin_orgs)
 
-        # Clear all user states
-        user_state.clear()
+    async with pool.acquire() as conn:
 
-        await query.edit_message_text(
-            f"🗑 Cleared {deleted_count} updates.\n"
-            f"🖼 Deleted {removed} images ({failed} failed)."
+        # 1. Get image paths first (before deleting)
+        image_rows = await conn.fetch(
+            "SELECT image_path FROM updates WHERE org_id = ANY($1)",
+            org_tuple
         )
-        await show_main_menu(update, context)
+        image_paths = [row["image_path"] for row in image_rows if row["image_path"]]
 
-    elif choice == "cancel_clear":
-        await query.edit_message_text("❌ Cancelled.")
-        await show_main_menu(update, context)
+        # 2. Delete the updates
+        result = await conn.execute(
+            "DELETE FROM updates WHERE org_id = ANY($1)",
+            org_tuple
+        )
+
+    # 🧹 Delete images from disk
+    removed = 0
+    failed = 0
+    for path in image_paths:
+        if os.path.exists(path):
+            try:
+                os.remove(path)
+                removed += 1
+            except:
+                failed += 1
+
+    await query.edit_message_text(
+        f"🗑 Cleared updates for <b>{len(admin_orgs)}</b> organization(s).\n"
+        f"🖼 Deleted {removed} images ({failed} failed).",
+        parse_mode="HTML"
+    )
+
+    await show_main_menu(update, context)
+
 
 # === HANDLE TEXT, AUDIO + IMAGE ===
 def transcribe_audio_assemblyai(audio_source: str):
@@ -715,30 +673,23 @@ async def handle_audio(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 print(f"Failed to remove temp file {file_path}: {e}")
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE, override_text=None):
-    # Determine the source (message only, we don’t handle callbacks here)
     if not update.message:
         return
 
     user_id = update.message.from_user.id
-    username = update.message.from_user.username
+    username = update.message.from_user.username or ""
     msg_source = update.message
 
-    # ✅ Only process if user is in update mode
+    # Only process if user is in update mode
     if user_state.get(user_id) != "awaiting_update":
         return
 
-    # --- Fetch organization for this user ---
-    conn = sqlite3.connect(DB_PATH)
-    cursor = conn.cursor()
-    cursor.execute("SELECT org FROM users WHERE user_id=?", (user_id,))
-    row = cursor.fetchone()
-    conn.close()
-
-    if not row:
-        await msg_source.reply_text("⚠️ You are not registered under any organization.")
+    # --- Fetch active organization for this user ---
+    org_id = context.user_data.get("active_org_id")
+    if not org_id:
+        await msg_source.reply_text("⚠️ Please select an organization first to send an update.")
         return
 
-    organization = row[0]
     image_path = None
 
     # --- Handle image ---
@@ -747,10 +698,10 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE, ove
         image_path = f"{user_id}_{datetime.now().timestamp()}.jpg"
         await file.download_to_drive(image_path)
 
-    # --- Decide what text to use ---
-    if override_text:  # from audio transcription
+    # --- Decide text ---
+    if override_text:
         text = override_text
-    elif msg_source.caption:  # from image caption
+    elif msg_source.caption:
         text = msg_source.caption
     else:
         text = msg_source.text or ""
@@ -759,73 +710,86 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE, ove
         await msg_source.reply_text("⚠️ Please send some text, audio, or an image with a caption.")
         return
 
-    # --- Process text into structured format ---
     structured = structure_text(text) if text.strip() else "[No text provided]"
 
-    save_update(
-        user_id=user_id,
-        username=username,
-        organization=organization,
-        original_text=text,
-        structured_text=structured,
-        image_path=image_path
-    )
+    # --- Save update in Postgres ---
+    async with pool.acquire() as conn:
+        await conn.execute(
+            """
+            INSERT INTO updates (user_id, org_id, username, original_text, structured_text, image_path)
+            VALUES ($1, $2, $3, $4, $5, $6)
+            """,
+            user_id, org_id, username, text, structured, image_path
+        )
 
-    # Send the structured update confirmation
+    # Confirmation message
     await msg_source.reply_text(f"✅ Here's your structured update:\n\n{structured}")
 
-    # Reset state after update
+    # Reset state
     user_state.pop(user_id, None)
 
     # Show role-based main menu again
     await show_main_menu(update, context)
 
+
 # === Get Updates ===
 # === /get_updates COMMAND (with images) ===
 async def get_updates(update_or_query, context: ContextTypes.DEFAULT_TYPE, limit=3):
-    # Handle both message and callback cases
+    # Determine chat object
     if hasattr(update_or_query, "message") and update_or_query.message:
         chat = update_or_query.message
-    else:
+    elif hasattr(update_or_query, "callback_query") and update_or_query.callback_query:
         query = update_or_query.callback_query
         chat = query.message
-
-    print("DEBUG: get_updates triggered from:", type(chat))
-
-    # Fetch latest updates
-    conn = sqlite3.connect(DB_PATH)
-    cursor = conn.cursor()
-    cursor.execute(
-        "SELECT username, structured_text, timestamp, image_path "
-        "FROM updates ORDER BY timestamp DESC LIMIT ?",
-        (limit,)
-    )
-    rows = cursor.fetchall()
-    rows.reverse()  # Show oldest first
-    conn.close()
-
-    if not rows:
-        await chat.reply_text("No updates recorded yet.")
+        await query.answer()
+    else:
         return
 
-    # Send each update
-    for username, structured_text, timestamp, image_path in rows:
+    user_id = chat.from_user.id
+
+    # --- Determine active organization for this user ---
+    org_id = context.user_data.get("active_org_id")
+    if not org_id:
+        await chat.reply_text("⚠ Please select an organization first to view updates.")
+        return
+
+    # --- Fetch latest updates for this org ---
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(
+            """
+            SELECT u.username, upd.structured_text, upd.timestamp, upd.image_path
+            FROM updates upd
+            JOIN users u ON upd.user_id = u.user_id
+            WHERE upd.org_id = $1
+            ORDER BY upd.timestamp DESC
+            LIMIT $2
+            """,
+            org_id, limit
+        )
+
+    if not rows:
+        await chat.reply_text("No updates recorded yet for this organization.")
+        return
+
+    # Send updates oldest-first
+    for row in reversed(rows):
         await send_executive_update(
-            chat,  # works whether it's a Message or CallbackQuery.message
-            username=username,
-            timestamp=timestamp,
-            structured_text=structured_text,
-            image_path=image_path,
+            chat,
+            username=row["username"],
+            timestamp=row["timestamp"],
+            structured_text=row["structured_text"],
+            image_path=row["image_path"],
         )
         await asyncio.sleep(0.2)  # avoid spamming too quickly
 
-    # Return to the correct main menu
+    # Return to main menu
     await show_main_menu(update_or_query, context)
+
 
 async def send_executive_update(chat, username, timestamp, structured_text, image_path=None):
     """Send a nicely formatted executive-style update with optional image."""
     message_text = (
-        f"👤 **@{username}**\n"
+        f"👤 <b>@{username}</b>\n"
         f"{structured_text}"
     )
 
