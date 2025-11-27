@@ -183,7 +183,7 @@ async def get_admin_org_ids(user_id: int) -> list[int]:
         return [r["org_id"] for r in rows]
 
 
-async def get_user_data(telegram_id: int) -> dict | None:
+async def get_user_data(user_id: int) -> dict | None:
     async with pool.acquire() as conn:
 
         # Fetch user core data
@@ -191,9 +191,9 @@ async def get_user_data(telegram_id: int) -> dict | None:
             """
             SELECT id, first_name, surname
             FROM users
-            WHERE telegram_id = $1
+            WHERE user_id = $1
             """,
-            telegram_id
+            user_id
         )
 
         if not user:
@@ -339,6 +339,7 @@ async def show_main_menu(update_or_query, context: ContextTypes.DEFAULT_TYPE):
             [InlineKeyboardButton("📝 Send Update", callback_data="send_update")],
             [InlineKeyboardButton("📄 Last Update", callback_data="last_update")],
             [InlineKeyboardButton("📜 Recent Updates", callback_data="recent_updates")],
+            [InlineKeyboardButton("📂 Switch Organization", callback_data="switch_org")],
         ]
 
     markup = InlineKeyboardMarkup(buttons)
@@ -369,6 +370,7 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         keyboard = [[InlineKeyboardButton("📝 Send Update", callback_data="send_update")]]
         if is_admin(user_id):
             keyboard.append([InlineKeyboardButton("🗑️ Clear Updates", callback_data="clear_updates")])
+        keyboard.append([InlineKeyboardButton("📂 Switch Organization", callback_data="switch_org")])
         keyboard.append([InlineKeyboardButton("📋 Main Menu", callback_data="main_menu")])
         await query.edit_message_text("🔄 More Options:", reply_markup=InlineKeyboardMarkup(keyboard))
 
@@ -386,7 +388,11 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await clear_updates(update, context)
         else:
             await query.edit_message_text("🚫 You are not authorized to clear updates.")
-    
+
+    elif action.startswith("setorg:"):
+        org_id = int(action.split(":")[1])
+        await set_active_org_callback(update, context)
+
     elif action == "main_menu":
         await show_main_menu(update, context)
 
@@ -395,6 +401,49 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         print(f"DEBUG: Unhandled callback data = {action}")
         await query.edit_message_text("⚠️ Unknown action. Returning to main menu...")
         await show_main_menu(update, context)
+
+
+async def switch_org(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.message.from_user.id
+
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(
+            "SELECT org_id FROM user_orgs WHERE user_id=$1",
+            user_id
+        )
+
+    if not rows:
+        return await update.message.reply_text(
+            "You are not assigned to any organization yet."
+        )
+
+    keyboard = [
+        [InlineKeyboardButton(f"Organization {r['org_id']}", callback_data=f"setorg:{r['org_id']}")]
+        for r in rows
+    ]
+
+    await update.message.reply_text(
+        "Select your active organization:",
+        reply_markup=InlineKeyboardMarkup(keyboard)
+    )
+
+async def set_active_org_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+
+    data = query.data
+    if not data.startswith("setorg:"):
+        return
+
+    org_id = int(data.split(":")[1])
+    user_id = query.from_user.id
+
+    # Save *in memory* (your current design)
+    context.user_data["active_org_id"] = org_id
+
+    await query.edit_message_text(
+        f"✅ Active organization set to Organization {org_id}"
+    )
 
 # === SEND UPDATE FLOW ===
 async def send_update(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -837,6 +886,7 @@ async def main():
     app.add_handler(CallbackQueryHandler(show_main_menu, pattern="^cancel_update$"))
     app.add_handler(CallbackQueryHandler(clear_updates, pattern="^clear_updates$"))
     app.add_handler(CallbackQueryHandler(handle_confirmation, pattern="^(confirm_clear|cancel_clear)$"))
+    app.add_handler(CallbackQueryHandler(set_active_org_callback, pattern=r"^setorg:\d+$"))
 
     # Generic fallback for other callback_data
     app.add_handler(CallbackQueryHandler(callback_handler))
