@@ -879,12 +879,12 @@ async def main():
     
     # === COMMANDS ===
     # === INLINE MENU CALLBACKS ===
-    app.add_handler(CallbackQueryHandler(show_main_menu, pattern="^main_menu$"))
+    # app.add_handler(CallbackQueryHandler(show_main_menu, pattern="^main_menu$"))
     # app.add_handler(CallbackQueryHandler(get_updates, pattern="^(last_update|recent_updates)$"))
-    app.add_handler(CallbackQueryHandler(send_update, pattern="^send_update$"))
+    # app.add_handler(CallbackQueryHandler(send_update, pattern="^send_update$"))
     app.add_handler(CallbackQueryHandler(more_options, pattern="^more_options$"))
-    app.add_handler(CallbackQueryHandler(show_main_menu, pattern="^cancel_update$"))
-    app.add_handler(CallbackQueryHandler(clear_updates, pattern="^clear_updates$"))
+    # app.add_handler(CallbackQueryHandler(show_main_menu, pattern="^cancel_update$"))
+    # app.add_handler(CallbackQueryHandler(clear_updates, pattern="^clear_updates$"))
     app.add_handler(CallbackQueryHandler(handle_confirmation, pattern="^(confirm_clear|cancel_clear)$"))
     app.add_handler(CallbackQueryHandler(set_active_org_callback, pattern=r"^setorg:\d+$"))
 
